@@ -1,0 +1,195 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: envoy-config
+  namespace: grpc-routing-poc
+data:
+  envoy.yaml: |
+    admin:
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 9901
+
+    static_resources:
+      listeners:
+      - name: grpc_listener
+        address:
+          socket_address:
+            address: 0.0.0.0
+            port_value: 8443
+        filter_chains:
+        - filters:
+          - name: envoy.filters.network.http_connection_manager
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+              stat_prefix: ingress_http
+              codec_type: AUTO
+              route_config:
+                name: local_route
+                virtual_hosts:
+                - name: grpc_backend
+                  domains: ["*"]
+                  routes:
+                  - match:
+                      prefix: "/"
+                      grpc: {}
+                      headers:
+                      - name: agent-version
+                        string_match:
+                          prefix: "v2."
+                    route:
+                      cluster: server-v2
+                  - match:
+                      prefix: "/"
+                      grpc: {}
+                      headers:
+                      - name: agent-version
+                        string_match:
+                          prefix: "v1."
+                    route:
+                      cluster: server-v1
+                  - match:
+                      prefix: "/"
+                      grpc: {}
+                    route:
+                      cluster: server-v1
+              http_filters:
+              - name: envoy.filters.http.router
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+              http2_protocol_options: {}
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                alpn_protocols:
+                - h2
+                tls_certificates:
+                - certificate_chain:
+                    filename: /etc/envoy/certs/cert.pem
+                  private_key:
+                    filename: /etc/envoy/certs/key.pem
+
+      clusters:
+      - name: server-v1
+        connect_timeout: 5s
+        type: STRICT_DNS
+        lb_policy: ROUND_ROBIN
+        http2_protocol_options: {}
+        load_assignment:
+          cluster_name: server-v1
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: server-v1.grpc-routing-poc.svc.cluster.local
+                    port_value: 50051
+        common_lb_config:
+          healthy_panic_threshold:
+            value: 0
+        circuit_breakers:
+          thresholds:
+          - priority: DEFAULT
+            max_connections: 100000
+            max_requests: 100000
+
+      - name: server-v2
+        connect_timeout: 5s
+        type: STRICT_DNS
+        lb_policy: ROUND_ROBIN
+        http2_protocol_options: {}
+        load_assignment:
+          cluster_name: server-v2
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: server-v2.grpc-routing-poc.svc.cluster.local
+                    port_value: 50051
+        common_lb_config:
+          healthy_panic_threshold:
+            value: 0
+        circuit_breakers:
+          thresholds:
+          - priority: DEFAULT
+            max_connections: 100000
+            max_requests: 100000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: envoy-ingress
+  namespace: grpc-routing-poc
+  labels:
+    app: envoy-ingress
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: envoy-ingress
+  template:
+    metadata:
+      labels:
+        app: envoy-ingress
+    spec:
+      containers:
+      - name: envoy
+        image: envoyproxy/envoy:v1.28-latest
+        ports:
+        - containerPort: 8443
+          name: grpc
+        - containerPort: 9901
+          name: admin
+        volumeMounts:
+        - name: config
+          mountPath: /etc/envoy
+          readOnly: true
+        - name: certs
+          mountPath: /etc/envoy/certs
+          readOnly: true
+        command:
+        - /usr/local/bin/envoy
+        args:
+        - -c
+        - /etc/envoy/envoy.yaml
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+      volumes:
+      - name: config
+        configMap:
+          name: envoy-config
+      - name: certs
+        secret:
+          secretName: envoy-certs
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: envoy-ingress
+  namespace: grpc-routing-poc
+  labels:
+    app: envoy-ingress
+spec:
+  type: NodePort
+  ports:
+  - port: 8443
+    targetPort: 8443
+    nodePort: 30443
+    protocol: TCP
+    name: grpc
+  - port: 9901
+    targetPort: 9901
+    nodePort: 30901
+    protocol: TCP
+    name: admin
+  selector:
+    app: envoy-ingress

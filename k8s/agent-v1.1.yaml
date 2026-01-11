@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-v1-1
+  namespace: grpc-routing-poc
+  labels:
+    app: agent
+    version: v1.1
+    major-version: v1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent
+      version: v1.1
+  template:
+    metadata:
+      labels:
+        app: agent
+        version: v1.1
+        major-version: v1
+    spec:
+      containers:
+      - name: agent
+        image: grpc-routing-poc/agent:latest
+        imagePullPolicy: Never
+        env:
+        - name: AGENT_VERSION
+          value: "v1.1"
+        - name: AGENT_ID
+          value: "agent-v1.1-00000000-0000-0000-0000-000000000011"
+        - name: SERVER_ADDRESS
+          value: "envoy-ingress.grpc-routing-poc.svc.cluster.local:8443"
+        - name: USE_TLS
+          value: "true"
+        resources:
+          requests:
+            memory: "32Mi"
+            cpu: "50m"
+          limits:
+            memory: "64Mi"
+            cpu: "100m"

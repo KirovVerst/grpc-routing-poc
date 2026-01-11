@@ -1,0 +1,42 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace file
+go.work
+
+# Generated proto files
+proto/ping.pb.go
+proto/ping_grpc.pb.go
+
+# TLS certificates and keys
+*.pem
+*.csr
+*.srl
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+server/server
+agent/agent
+
+# Kubernetes secrets (if exported)
+*.kubeconfig
