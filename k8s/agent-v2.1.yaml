@@ -28,7 +28,9 @@ spec:
         - name: AGENT_VERSION
           value: "v2.1"
         - name: AGENT_ID
-          value: "agent-v2.1-00000000-0000-0000-0000-000000000021"
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
         - name: SERVER_ADDRESS
           value: "envoy-ingress.grpc-routing-poc.svc.cluster.local:8443"
         - name: USE_TLS

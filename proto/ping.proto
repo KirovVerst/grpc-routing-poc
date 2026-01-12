@@ -5,7 +5,7 @@ package ping;
 option go_package = "github.com/kirovverst/grpc-routing-poc/proto";
 
 service PingService {
-  rpc Ping(PingRequest) returns (PingResponse);
+  rpc PingPong(stream PingRequest) returns (stream PingResponse);
 }
 
 message PingRequest {
@@ -15,4 +15,5 @@ message PingRequest {
 message PingResponse {
   string message = 1;
   string server_version = 2;
+  string server_id = 3;
 }

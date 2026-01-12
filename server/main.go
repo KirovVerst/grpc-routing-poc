@@ -1,8 +1,8 @@
 package main
 
 import (
-	"context"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -19,9 +19,14 @@ type server struct {
 	version string
 }
 
-func (s *server) Ping(ctx context.Context, req *pb.PingRequest) (*pb.PingResponse, error) {
-	// Extract metadata from context
-	md, ok := metadata.FromIncomingContext(ctx)
+func (s *server) PingPong(stream pb.PingService_PingPongServer) error {
+	serverID := os.Getenv("HOSTNAME")
+	if serverID == "" {
+		serverID = "unknown"
+	}
+
+	// Extract metadata once at stream start
+	md, ok := metadata.FromIncomingContext(stream.Context())
 
 	agentVersion := "unknown"
 	agentID := "unknown"
@@ -35,14 +40,39 @@ func (s *server) Ping(ctx context.Context, req *pb.PingRequest) (*pb.PingRespons
 		}
 	}
 
-	// Logging
-	log.Printf("[SERVER_%s] agent-id=%s agent-version=%s message=%s",
-		s.version, agentID, agentVersion, req.Message)
+	log.Printf("[SERVER_%s/%s] Stream opened from agent-id=%s agent-version=%s",
+		s.version, serverID, agentID, agentVersion)
 
-	return &pb.PingResponse{
-		Message:       fmt.Sprintf("Pong from server-%s", s.version),
-		ServerVersion: s.version,
-	}, nil
+	for {
+		req, err := stream.Recv()
+		if err == io.EOF {
+			log.Printf("[SERVER_%s/%s] Stream closed by agent-id=%s", s.version, serverID, agentID)
+			return nil
+		}
+		if err != nil {
+			log.Printf("[SERVER_%s/%s] Stream error from agent-id=%s: %v", s.version, serverID, agentID, err)
+			return err
+		}
+
+		// Log received ping with source info
+		log.Printf("[SERVER_%s/%s] Received ping from agent-id=%s agent-version=%s message=%s",
+			s.version, serverID, agentID, agentVersion, req.Message)
+
+		// Send pong response
+		resp := &pb.PingResponse{
+			Message:       "pong",
+			ServerVersion: s.version,
+			ServerId:      serverID,
+		}
+
+		if err := stream.Send(resp); err != nil {
+			log.Printf("[SERVER_%s/%s] Failed to send pong to agent-id=%s: %v", s.version, serverID, agentID, err)
+			return err
+		}
+
+		log.Printf("[SERVER_%s/%s] Sent pong to agent-id=%s",
+			s.version, serverID, agentID)
+	}
 }
 
 func main() {

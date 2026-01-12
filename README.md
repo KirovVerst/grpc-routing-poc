@@ -28,15 +28,16 @@ Proof of Concept for routing gRPC requests by client version with sticky routing
 
 ## Overview
 
-This project demonstrates gRPC request routing based on client version using Envoy proxy. The system uses prefix matching to route clients with vX.Y versions to corresponding vX backend clusters.
+This project demonstrates gRPC request routing based on client version using Envoy proxy with bidirectional streaming. The system uses prefix matching to route clients with vX.Y versions to corresponding vX backend clusters, maintaining long-lived streaming connections for continuous ping-pong communication.
 
 ## Key Features
 
-- **Sticky Routing**: one agent always routes to the same backend cluster throughout the connection
+- **Bidirectional Streaming**: agents and servers maintain long-lived bidirectional streams for continuous ping-pong communication
+- **Sticky Routing**: one agent always routes to the same backend cluster and pod throughout the stream connection
 - **vX.Y → vX Versioning**: agents use format v1.1, v1.2, v2.1, v2.2; servers use v1, v2
 - **Prefix-based Routing**: Envoy uses prefix matching on `agent-version` header (v1.* → server-v1, v2.* → server-v2)
 - **TLS Termination**: TLS terminates at Envoy, upstream connections without TLS
-- **HTTP/2 End-to-End**: full HTTP/2 support for efficient gRPC operations
+- **HTTP/2 End-to-End**: full HTTP/2 support for efficient gRPC streaming operations
 
 ## Architecture
 
@@ -50,20 +51,20 @@ This project demonstrates gRPC request routing based on client version using Env
 │  │                                                            │  │
 │  │  ┌──────────────┐      ┌──────────────────────────┐        │  │
 │  │  │  Agent v1.1  │      │                          │        │  │
-│  │  │  (1 replica) │──────│      Envoy Ingress       │        │  │
+│  │  │  (N replicas)│──────│      Envoy Ingress       │        │  │
 │  │  │              │ gRPC │      (1 replica)         │        │  │
 │  │  │ metadata:    │ +TLS │                          │        │  │
 │  │  │ version=v1.1 │──────│  • TLS termination       │        │  │
-│  │  │ id=uuid-1    │      │  • Route by metadata     │        │  │
+│  │  │ id=pod-name  │      │  • Route by metadata     │        │  │
 │  │  └──────────────┘      │  • HTTP/2 upstream       │        │  │
 │  │                        │                          │        │  │
 │  │  ┌──────────────┐      │                          │        │  │
 │  │  │  Agent v2.1  │      │                          │        │  │
-│  │  │  (1 replica) │──────│                          │        │  │
+│  │  │  (N replicas)│──────│                          │        │  │
 │  │  │              │ gRPC │                          │        │  │
 │  │  │ metadata:    │ +TLS │                          │        │  │
 │  │  │ version=v2.1 │──────│                          │        │  │
-│  │  │ id=uuid-2    │      └────────┬─────────────────┘        │  │
+│  │  │ id=pod-name  │      └────────┬─────────────────┘        │  │
 │  │  └──────────────┘               │                          │  │
 │  │                                 │                          │  │
 │  │                      ┌──────────┴────────────┐             │  │
@@ -88,13 +89,14 @@ This project demonstrates gRPC request routing based on client version using Env
 **Purpose**: Emulates a client application of a specific version.
 
 **Characteristics**:
-- Single long-lived gRPC connection
-- Request frequency: every 5 seconds
+- Single long-lived gRPC bidirectional streaming connection
+- Sends ping messages every 5 seconds
+- Receives pong responses continuously
 - Automatic reconnection on connection loss
 
 **Metadata**:
 - `agent-version`: agent version in vMAJOR.MINOR format (v1.1, v1.2, v2.1, v2.2)
-- `agent-id`: unique agent identifier (UUID)
+- `agent-id`: unique agent identifier (Kubernetes pod name via Downward API)
 
 **Deployment Versions**:
 - `agent-v1.1`: minor version 1.1 → routed to server-v1
@@ -105,46 +107,54 @@ This project demonstrates gRPC request routing based on client version using Env
 **Behavior**:
 ```
 1. Connect to envoy-ingress.grpc-routing-poc.svc.cluster.local:8443 (TLS)
-2. For each request, add metadata:
+2. Open bidirectional stream with metadata:
    - agent-version: v1.1
-   - agent-id: agent-v1.1-uuid
-3. Call Ping() method every 5 seconds
-4. Log result: success or error
-5. Reconnect on error
+   - agent-id: agent-v1-1-<pod-hash> (from Kubernetes pod name)
+3. Start receive goroutine to listen for pong responses
+4. Send ping messages every 5 seconds on the stream
+5. Log each ping sent and pong received with server pod details
+6. Reconnect and reopen stream on error
 ```
 
 #### 2. Server (gRPC Server)
 
-**Purpose**: gRPC backend that processes requests.
+**Purpose**: gRPC backend that processes streaming requests.
 
 **Characteristics**:
 - Language: Go
 - HTTP/2 without TLS (plain text connection)
-- Logs incoming requests with metadata
+- Handles bidirectional streaming connections
+- Logs incoming requests with agent metadata and pod information
 
 **Deployment Versions**:
-- `server-v1`: 2 replicas, accepts requests from agents v1.*
-- `server-v2`: 2 replicas, accepts requests from agents v2.*
+- `server-v1`: 2 replicas, accepts streams from agents v1.*
+- `server-v2`: 2 replicas, accepts streams from agents v2.*
 
 **Behavior**:
 ```
 1. Listen on :50051 (HTTP/2, no TLS)
-2. Accept Ping() requests
-3. Extract metadata:
+2. Accept PingPong() bidirectional streaming requests
+3. Extract metadata once at stream start:
    - agent-version
    - agent-id
-4. Log: [SERVER_v1] agent-id=... agent-version=... message=ping
-5. Return: Pong from server-v1 (server=v1)
+4. Log stream opening with agent details
+5. Receive ping messages continuously:
+   - Log: [SERVER_v1/pod-name] Received ping from agent-id=... agent-version=...
+6. Send pong responses immediately:
+   - Include server version and pod ID (HOSTNAME)
+   - Log: [SERVER_v1/pod-name] Sent pong to agent-id=...
+7. Handle stream closure gracefully
 ```
 
 #### 3. Envoy Proxy (Ingress)
 
-**Purpose**: Routes gRPC requests based on metadata with TLS termination.
+**Purpose**: Routes gRPC bidirectional streams based on metadata with TLS termination.
 
 **Characteristics**:
 - TLS listener on port 8443
-- Routes based on `agent-version` header
+- Routes streams based on `agent-version` header
 - HTTP/2 upstream connections (no TLS)
+- Maintains stream routing throughout connection lifetime
 - Admin interface on port 9901
 
 ##### Routing Rules
@@ -182,55 +192,91 @@ Useful endpoints:
 - `/clusters` - cluster status
 - `/listeners` - listener status
 
+##### HTTP/2 Stream Isolation
+
+**Connection Pooling vs Stream Isolation**:
+
+Envoy maintains a connection pool to upstream servers for efficiency. However, **metadata and messages are isolated per HTTP/2 stream**, not per TCP connection:
+
+```
+Agent Pod A ──[Stream 1: agent-id=agent-v1-1-abc-123]──┐
+                                                        ├──> Envoy ──[1 TCP]──> Server Pod
+Agent Pod B ──[Stream 3: agent-id=agent-v1-1-def-456]──┘            ├─> Stream 1: agent-id=agent-v1-1-abc-123
+                                                                     └─> Stream 3: agent-id=agent-v1-1-def-456
+```
+
+**Key Points**:
+
+- **One TCP connection** can multiplex **multiple gRPC streams**
+- Each stream carries its own **gRPC metadata** (agent-id, agent-version)
+- Server receives each stream as a **separate `PingPong()` call** with correct metadata
+- Streams are **fully isolated** - metadata from one stream never leaks to another
+- This enables **one server pod to handle multiple agents simultaneously** with distinct identities
+
+**Practical Impact**:
+
+✅ Server can distinguish between agents even when they share the same upstream TCP connection
+
+✅ Each agent gets its own isolated bidirectional stream with proper metadata
+
+✅ Perfect for scenarios requiring per-agent resources (e.g., RabbitMQ queues, sessions)
+
+✅ Connection pooling provides efficiency without breaking isolation
+
 ### Sticky Routing Principle
 
-**Key Idea**: One TCP connection → one backend server
+**Key Idea**: One bidirectional stream → one backend server pod
 
 ```
 ┌─────────────┐                                 ┌─────────────┐
-│  Agent v1.1 │────────────────────────────────▶│  Server v1  │
-│             │  1 TCP connection               │  (replica 1)│
-│  5s pings   │  All requests via this conn     │             │
+│  Agent v1.1 │◀───────────────────────────────▶│  Server v1  │
+│             │  1 bidirectional stream         │  (replica 1)│
+│  5s pings   │  All messages via this stream   │             │
 └─────────────┘                                 └─────────────┘
      │
-     │ connection breaks
+     │ stream closes
      ▼
 ┌─────────────┐                                 ┌─────────────┐
-│  Agent v1.1 │────────────────────────────────▶│  Server v1  │
-│             │  new TCP connection             │  (replica 2)│
+│  Agent v1.1 │◀───────────────────────────────▶│  Server v1  │
+│             │  new stream                     │  (replica 2)│
 │  reconnect  │  (may route to different pod)   │             │
 └─────────────┘                                 └─────────────┘
 ```
 
 **How It Works**:
 
-1. **Connection Level**:
+1. **Stream Level**:
    - Agent establishes 1 TCP connection with Envoy
-   - Envoy reads metadata once (first request)
-   - Routes connection to appropriate cluster (server-v1 or server-v2)
+   - Opens bidirectional gRPC stream with metadata
+   - Envoy reads metadata at stream start
+   - Routes stream to appropriate cluster (server-v1 or server-v2)
    - Envoy selects 1 backend pod (Round Robin)
 
 2. **Sticky Behavior**:
-   - All subsequent requests use the same TCP connection
-   - Connection stays with the same backend pod
-   - No re-routing happens during connection lifetime
+   - All ping/pong messages use the same bidirectional stream
+   - Stream stays with the same backend pod throughout its lifetime
+   - No re-routing happens during stream lifetime
+   - Continuous communication without per-request overhead
 
 3. **Reconnection**:
-   - On connection failure, agent reconnects
-   - New connection may route to a different pod
-   - But all requests within new connection go to the same pod
+   - On stream or connection failure, agent reconnects
+   - Opens new stream with metadata
+   - New stream may route to a different pod
+   - But all messages within new stream go to the same pod
 
 **Example**:
 ```
-Time | Agent v1.1 | Connection | Backend
+Time | Agent v1.1 | Stream     | Backend
 -----|------------|------------|----------
-0s   | connect    | TCP-1      | server-v1-pod-A
-5s   | ping #1    | TCP-1      | server-v1-pod-A
-10s  | ping #2    | TCP-1      | server-v1-pod-A
-15s  | [ERROR]    | TCP-1      | connection lost
-16s  | reconnect  | TCP-2      | server-v1-pod-B
-20s  | ping #3    | TCP-2      | server-v1-pod-B
-25s  | ping #4    | TCP-2      | server-v1-pod-B
+0s   | open stream| STREAM-1   | server-v1-pod-A
+5s   | ping #1    | STREAM-1   | server-v1-pod-A
+5s   | pong #1    | STREAM-1   | server-v1-pod-A
+10s  | ping #2    | STREAM-1   | server-v1-pod-A
+10s  | pong #2    | STREAM-1   | server-v1-pod-A
+15s  | [ERROR]    | STREAM-1   | stream closed
+16s  | open stream| STREAM-2   | server-v1-pod-B
+20s  | ping #3    | STREAM-2   | server-v1-pod-B
+20s  | pong #3    | STREAM-2   | server-v1-pod-B
 ```
 
 ### Network Topology
@@ -274,7 +320,7 @@ envoy pod
 
 ### Data Flows
 
-#### Successful Request Flow
+#### Bidirectional Streaming Flow
 
 ```
 Agent v1.1                Envoy                 Server v1
@@ -283,7 +329,7 @@ Agent v1.1                Envoy                 Server v1
     │ │                     │                       │
     │ └◀─ TLS Established ──│                       │
     │                       │                       │
-    │ ┌─ gRPC Ping ────────▶│                       │
+    │ ┌─ Open Stream ───────▶│                       │
     │ │  metadata:          │                       │
     │ │  - agent-version:v1.1                       │
     │ │  - agent-id:uuid    │                       │
@@ -291,27 +337,36 @@ Agent v1.1                Envoy                 Server v1
     │ │                     │ ┌─ Check metadata     │
     │ │                     │ │  v1.1 → server-v1   │
     │ │                     │ │                     │
-    │ │                     │ └─ HTTP/2 Ping ──────▶│
+    │ │                     │ └─ HTTP/2 Stream ────▶│
     │ │                     │    (no TLS)           │
-    │ │                     │                       │
-    │ │                     │                       │ ┌─ Process
-    │ │                     │                       │ │  Log request
-    │ │                     │                       │ └─ Generate response
-    │ │                     │                       │
-    │ │                     │ ◀── Pong response ────┘
-    │ │                     │     "Pong from        │
-    │ │                     │      server-v1"       │
-    │ │                     │                       │
-    │ └◀─ Pong (via TLS) ───┘                       │
+    │ └◀─ Stream Ready ─────┴───────────────────────┘
+    │                       │                       │
+    │                       │                       │ ┌─ Log stream opened
+    │                       │                       │ │  with agent details
+    │                       │                       │ └─
+    │                       │                       │
+    │ ── Ping ─────────────▶│──────────────────────▶│
+    │                       │                       │ ┌─ Log ping received
+    │                       │                       │ └─
+    │                       │                       │
+    │ ◀─ Pong ──────────────│◀──────────────────────│
+    │                       │                       │ ┌─ Log pong sent
+    │                       │                       │ └─
+    │                       │                       │
+    │ ── Ping ─────────────▶│──────────────────────▶│
+    │ ◀─ Pong ──────────────│◀──────────────────────│
+    │                       │                       │
+    │    (continuous ping-pong every 5s)            │
+    │◀──────────────────────────────────────────────▶│
     │                       │                       │
     ▼                       ▼                       ▼
-  Log success          Forward response         Log completion
+  Log each message    Forward messages        Log each message
 ```
 
 #### Routing Decision
 
 ```
-Request arrives at Envoy
+Stream opens at Envoy
       │
       ▼
 Extract metadata header "agent-version"
@@ -331,7 +386,11 @@ Extract metadata header "agent-version"
                       (if not exists)
                             │
                             ▼
-                      Forward request
+                      Open bidirectional stream
+                            │
+                            ▼
+                      Forward all messages on stream
+                      (sticky to same pod)
 ```
 
 ## Quick Start
@@ -363,11 +422,15 @@ make logs-agents-v2
 
 **Expected output** in agent logs:
 ```
-[AGENT_v1.1] Ping successful: Pong from server-v1 (server=v1)
-[AGENT_v1.2] Ping successful: Pong from server-v1 (server=v1)
-[AGENT_v2.1] Ping successful: Pong from server-v2 (server=v2)
-[AGENT_v2.2] Ping successful: Pong from server-v2 (server=v2)
+[AGENT_v1.1/agent-v1-1-7df8b5c9d-xyzab] Stream opened to envoy-ingress:8443
+[AGENT_v1.1/agent-v1-1-7df8b5c9d-xyzab] Sent ping
+[AGENT_v1.1/agent-v1-1-7df8b5c9d-xyzab] Received pong from server=v1/server-v1-abc123-def message=pong
+[AGENT_v1.2/agent-v1-2-9gh8k3l2m-pqrst] Stream opened to envoy-ingress:8443
+[AGENT_v1.2/agent-v1-2-9gh8k3l2m-pqrst] Sent ping
+[AGENT_v1.2/agent-v1-2-9gh8k3l2m-pqrst] Received pong from server=v1/server-v1-abc123-ghi message=pong
 ```
+
+Note: Agent ID is the Kubernetes pod name (e.g., `agent-v1-1-<hash>`), allowing easy traceability between logs and pods.
 
 ### Status Check
 
@@ -400,17 +463,20 @@ kubectl port-forward -n grpc-routing-poc svc/envoy-ingress 9901:9901
 #### Manual Verification
 
 ```bash
-# 1. Check v1 agents route to server-v1
-make logs-agents-v1 | grep "server-v1"
+# 1. Check v1 agents route to server-v1 and receive pongs
+make logs-agents-v1 | grep "Received pong from server=v1"
 
-# 2. Check v2 agents route to server-v2
-make logs-agents-v2 | grep "server-v2"
+# 2. Check v2 agents route to server-v2 and receive pongs
+make logs-agents-v2 | grep "Received pong from server=v2"
 
-# 3. Verify server-v1 receives only v1.* requests
-make logs-server-v1 | grep "agent-version"
+# 3. Verify server-v1 receives only v1.* streams
+make logs-server-v1 | grep "Stream opened from"
 
-# 4. Verify server-v2 receives only v2.* requests
-make logs-server-v2 | grep "agent-version"
+# 4. Verify server-v2 receives only v2.* streams
+make logs-server-v2 | grep "Stream opened from"
+
+# 5. Check continuous ping-pong communication
+make logs-agents-v1 | grep -E "(Sent ping|Received pong)"
 ```
 
 #### Automated Verification
@@ -434,24 +500,35 @@ Expected output:
    - v1.* agents route to server-v1
    - v2.* agents route to server-v2
 
-2. **✅ Sticky Routing**
-   - Single TCP connection per agent
-   - All requests use the same connection
-   - Connection stays with one backend pod
+2. **✅ Bidirectional Streaming**
+   - Long-lived bidirectional gRPC streams
+   - Continuous ping-pong communication
+   - Reduced per-message overhead
 
-3. **✅ TLS Termination**
+3. **✅ Sticky Routing**
+   - Single bidirectional stream per agent
+   - All messages use the same stream
+   - Stream stays with one backend pod throughout its lifetime
+
+4. **✅ TLS Termination**
    - Agents connect via TLS (port 8443)
    - Envoy terminates TLS
    - Upstream connections use plain HTTP/2
 
-4. **✅ HTTP/2 End-to-End**
-   - Full HTTP/2 support for gRPC
+5. **✅ HTTP/2 End-to-End**
+   - Full HTTP/2 support for gRPC streaming
    - Efficient connection multiplexing
 
-5. **✅ Automatic Reconnection**
-   - Agents reconnect on connection loss
-   - New connection may route to different pod
-   - Routing logic applies to new connection
+6. **✅ Automatic Reconnection**
+   - Agents reconnect and reopen stream on failure
+   - New stream may route to different pod
+   - Routing logic applies to new stream
+
+7. **✅ Horizontal Scalability with Unique Identity**
+   - Each agent replica gets unique ID from Kubernetes pod name
+   - Scale deployments to simulate multiple agents of same version
+   - Perfect for testing scenarios with many agents per version
+   - Server can distinguish each agent instance for per-agent resources
 
 ## Project Structure
 
@@ -466,10 +543,10 @@ Expected output:
 │   ├── go.mod
 │   └── Dockerfile
 ├── proto/
-│   ├── ping.proto         # Protocol Buffers definitions
+│   ├── ping.proto         # Protocol Buffers definitions (bidirectional streaming)
 │   ├── go.mod
 │   ├── ping.pb.go         # Generated Go code
-│   └── ping_grpc.pb.go    # Generated gRPC code
+│   └── ping_grpc.pb.go    # Generated gRPC streaming code
 ├── certs/
 │   ├── generate-certs.sh  # TLS certificate generation script
 │   ├── cert.pem           # Generated certificate
@@ -488,6 +565,16 @@ Expected output:
 └── README.md
 ```
 
+### Protocol Definition
+
+The bidirectional streaming RPC is defined in `proto/ping.proto`:
+
+**Key Points**:
+- `stream PingRequest` - client can send multiple messages
+- `stream PingResponse` - server can send multiple responses
+- Agent metadata (version, ID) sent via gRPC headers, not in message body
+- Server includes pod ID in responses for observability
+
 ## Testing
 
 ### Basic Tests
@@ -501,25 +588,31 @@ kubectl get pods -n grpc-routing-poc
 #### 2. View Agent v1.1 Logs
 ```bash
 make logs-agent-v1-1
-# Expected: "Ping successful: Pong from server-v1"
+# Expected: "Stream opened", "Sent ping", "Received pong from server=v1/..."
 ```
 
 #### 3. View Agent v2.1 Logs
 ```bash
 make logs-agent-v2-1
-# Expected: "Ping successful: Pong from server-v2"
+# Expected: "Stream opened", "Sent ping", "Received pong from server=v2/..."
 ```
 
 #### 4. View Server v1 Logs
 ```bash
 make logs-server-v1
-# Expected: agent-version=v1.1 or v1.2
+# Expected output:
+# [SERVER_v1/server-v1-abc123-def] Stream opened from agent-id=agent-v1-1-7df8b5c9d-xyzab agent-version=v1.1
+# [SERVER_v1/server-v1-abc123-def] Received ping from agent-id=agent-v1-1-7df8b5c9d-xyzab agent-version=v1.1 message=ping
+# [SERVER_v1/server-v1-abc123-def] Sent pong to agent-id=agent-v1-1-7df8b5c9d-xyzab
 ```
 
 #### 5. View Server v2 Logs
 ```bash
 make logs-server-v2
-# Expected: agent-version=v2.1 or v2.2
+# Expected output:
+# [SERVER_v2/server-v2-xyz789-ghi] Stream opened from agent-id=agent-v2-1-9gh8k3l2m-pqrst agent-version=v2.1
+# [SERVER_v2/server-v2-xyz789-ghi] Received ping from agent-id=agent-v2-1-9gh8k3l2m-pqrst agent-version=v2.1 message=ping
+# [SERVER_v2/server-v2-xyz789-ghi] Sent pong to agent-id=agent-v2-1-9gh8k3l2m-pqrst
 ```
 
 ### Advanced Tests
@@ -531,29 +624,42 @@ make logs-server-v2
 ```
 
 What it checks:
-- One agent maintains single connection
-- All requests go through same backend pod
-- Connection persists throughout test
+- One agent maintains single bidirectional stream
+- All ping/pong messages go through same backend pod
+- Stream persists throughout test
 
 Expected output:
 ```
 Testing sticky routing for agent-v1-1...
-✅ All 20 requests routed to same pod: server-v1-xxx
+✅ All 20 messages routed to same pod: server-v1-xxx
 Sticky routing works correctly!
 ```
 
-#### 2. Load Testing
+#### 2. Multi-Agent and Load Testing
 
 ```bash
-# Scale agents
+# Scale agents to simulate multiple agents of the same version
 kubectl scale deployment agent-v1-1 --replicas=5 -n grpc-routing-poc
 kubectl scale deployment agent-v2-1 --replicas=5 -n grpc-routing-poc
+
+# Verify each agent has unique ID (pod name)
+kubectl get pods -n grpc-routing-poc -l version=v1.1 -o custom-columns=NAME:.metadata.name
+# Output:
+# agent-v1-1-7df8b5c9d-xyzab
+# agent-v1-1-7df8b5c9d-pqrst
+# agent-v1-1-7df8b5c9d-lmnop
+# agent-v1-1-7df8b5c9d-uvwxy
+# agent-v1-1-7df8b5c9d-zabcd
+
+# Check server logs - should see multiple distinct agent-id connections
+kubectl logs -n grpc-routing-poc -l app=server,version=v1 --tail=20 | grep "Stream opened"
+# Expected: Multiple "Stream opened from agent-id=agent-v1-1-<different-hashes>"
 
 # Monitor Envoy metrics
 kubectl port-forward -n grpc-routing-poc svc/envoy-ingress 9901:9901
 curl http://localhost:9901/stats | grep grpc
 
-# Scale servers
+# Scale servers to handle load
 kubectl scale deployment server-v1 --replicas=4 -n grpc-routing-poc
 kubectl scale deployment server-v2 --replicas=4 -n grpc-routing-poc
 ```
@@ -568,9 +674,9 @@ kubectl delete pod -n grpc-routing-poc -l app=server,version=v1 --field-selector
 make logs-agent-v1-1 -f
 
 # Expected behavior:
-# - Connection error logged
-# - Automatic reconnection
-# - Requests resume with same routing
+# - Stream/connection error logged
+# - Automatic reconnection and stream reopening
+# - Ping/pong messages resume with same routing
 ```
 
 #### 4. TLS Testing
@@ -588,20 +694,20 @@ grpcurl -insecure localhost:30443 list
 #### 5. Metadata Testing
 
 ```bash
-# Test without agent-version header
-grpcurl -insecure \
-  -d '{"message": "ping"}' \
-  localhost:30443 \
-  ping.PingService/Ping
-# Should route to server-v1 (default route)
+# List available services
+grpcurl -insecure localhost:30443 list
+# Should show: ping.PingService
 
-# Test with v3.0 (unknown version)
-grpcurl -insecure \
-  -H 'agent-version: v3.0' \
-  -d '{"message": "ping"}' \
-  localhost:30443 \
-  ping.PingService/Ping
-# Should route to server-v1 (default route)
+# List methods
+grpcurl -insecure localhost:30443 list ping.PingService
+# Should show: ping.PingService.PingPong
+
+# Test bidirectional streaming (requires manual message sending)
+# Note: grpcurl has limited support for bidirectional streaming
+# Best to verify routing using agent logs and server logs
+
+# Check routing without agent-version header (uses default route)
+# Monitor logs: should route to server-v1 (default route)
 ```
 
 ## Makefile Commands
@@ -642,13 +748,20 @@ make clean          # Delete namespace and all resources
 #### Scaling Agents
 
 ```bash
-# Scale up
+# Scale up to simulate multiple agents of the same version
 kubectl scale deployment agent-v1-1 --replicas=10 -n grpc-routing-poc
+
+# Each replica gets a unique pod name and agent-id
+# Example pods:
+#   agent-v1-1-7df8b5c9d-xyzab → agent-id: agent-v1-1-7df8b5c9d-xyzab
+#   agent-v1-1-7df8b5c9d-pqrst → agent-id: agent-v1-1-7df8b5c9d-pqrst
+#   agent-v1-1-7df8b5c9d-lmnop → agent-id: agent-v1-1-7df8b5c9d-lmnop
 
 # Scale down
 kubectl scale deployment agent-v1-1 --replicas=1 -n grpc-routing-poc
 
-# All agents will maintain their own sticky connections
+# View all agent instances with their unique IDs
+kubectl get pods -n grpc-routing-poc -l version=v1.1 -o custom-columns=NAME:.metadata.name
 ```
 
 #### Scaling Servers
@@ -720,18 +833,19 @@ kubectl logs --timestamps -n grpc-routing-poc -l app=server,version=v1
    - v1.* agents → server-v1 (should be 100%)
    - v2.* agents → server-v2 (should be 100%)
 
-2. **Connection Stability**:
-   - Reconnection rate (should be low)
-   - Connection duration (should be high)
+2. **Stream Stability**:
+   - Stream reconnection rate (should be low)
+   - Stream duration (should be high - hours/days)
+   - Active streams per server
 
 3. **Performance**:
-   - Request latency (p50, p95, p99)
-   - Throughput (req/s)
+   - Message latency (p50, p95, p99)
+   - Throughput (messages/s)
    - Error rate (should be 0%)
 
 4. **Resource Usage**:
    - CPU utilization
-   - Memory usage
+   - Memory usage per stream
    - Network I/O
 
 ## License
