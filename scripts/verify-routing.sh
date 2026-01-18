@@ -11,7 +11,7 @@ echo ""
 
 # Check if namespace exists
 if ! kubectl get namespace $NAMESPACE &> /dev/null; then
-    echo "❌ Namespace $NAMESPACE does not exist. Please run 'make deploy' first."
+    echo "❌ Namespace $NAMESPACE does not exist. Please run 'make all-envoy' or 'make all-traefik' first."
     exit 1
 fi
 
@@ -77,11 +77,11 @@ echo "-------------------------------------------------------------------"
 kubectl logs -n $NAMESPACE -l version=v2.2 --tail=5 | grep -E "AGENT|Ping" || echo "No logs yet, wait a moment..."
 echo ""
 
-# Check Envoy admin
-echo "🔧 Envoy Admin Interface:"
+# Check Proxy admin
+echo "🔧 Proxy Admin Interface:"
 echo "-------------------------------------------------------------------"
-echo "To access Envoy admin interface, run:"
-echo "  kubectl port-forward -n $NAMESPACE svc/envoy-ingress 9901:9901"
+echo "To access proxy admin interface, run:"
+echo "  kubectl port-forward -n $NAMESPACE svc/proxy-ingress 9901:9901"
 echo "  Then open: http://localhost:9901"
 echo ""
 

@@ -6,6 +6,9 @@ Proof of Concept for routing gRPC requests by client version with sticky routing
 
 - [Overview](#overview)
 - [Key Features](#key-features)
+- [Proxy Options](#proxy-options)
+  - [Envoy](#envoy)
+  - [Traefik](#traefik)
 - [Architecture](#architecture)
   - [System Overview](#system-overview)
   - [Components](#components)
@@ -28,16 +31,55 @@ Proof of Concept for routing gRPC requests by client version with sticky routing
 
 ## Overview
 
-This project demonstrates gRPC request routing based on client version using Envoy proxy with bidirectional streaming. The system uses prefix matching to route clients with vX.Y versions to corresponding vX backend clusters, maintaining long-lived streaming connections for continuous ping-pong communication.
+This project demonstrates gRPC request routing based on client version using either Envoy or Traefik proxy with bidirectional streaming. The system uses header matching to route clients with vX.Y versions to corresponding vX backend clusters, maintaining long-lived streaming connections for continuous ping-pong communication.
 
 ## Key Features
 
 - **Bidirectional Streaming**: agents and servers maintain long-lived bidirectional streams for continuous ping-pong communication
 - **Sticky Routing**: one agent always routes to the same backend cluster and pod throughout the stream connection
 - **vX.Y → vX Versioning**: agents use format v1.1, v1.2, v2.1, v2.2; servers use v1, v2
-- **Prefix-based Routing**: Envoy uses prefix matching on `agent-version` header (v1.* → server-v1, v2.* → server-v2)
-- **TLS Termination**: TLS terminates at Envoy, upstream connections without TLS
+- **Header-based Routing**: proxy uses header matching on `agent-version` header (v1.* → server-v1, v2.* → server-v2)
+- **Multiple Proxy Options**: choose between Envoy or Traefik proxy
+- **TLS Termination**: TLS terminates at proxy, upstream connections without TLS
 - **HTTP/2 End-to-End**: full HTTP/2 support for efficient gRPC streaming operations
+
+## Proxy Options
+
+This PoC supports two proxy implementations with identical routing behavior:
+
+### Envoy
+
+**Image**: `envoyproxy/envoy:v1.28-latest`
+
+**Configuration**: YAML-based static and dynamic configuration
+- Uses `http_connection_manager` filter
+- Header prefix matching with route priorities
+- Native HTTP/2 and gRPC support
+
+**Deploy with**: `make deploy-envoy`
+
+**Advantages**:
+- Purpose-built for service mesh and API gateway
+- Extensive gRPC and HTTP/2 optimizations
+- Rich observability and metrics
+
+### Traefik
+
+**Image**: `traefik:v3.2`
+
+**Configuration**: Static and dynamic YAML configuration
+- Uses HeadersRegexp matchers for routing
+- Native HTTP/2 and gRPC support
+- Web dashboard on port 9901
+
+**Deploy with**: `make deploy-traefik`
+
+**Advantages**:
+- Simpler configuration syntax
+- Built-in web UI for monitoring
+- Auto-discovery capabilities (not used in this PoC)
+
+Both proxies use the same service name (`proxy-ingress`) and ports (8443 for gRPC, 9901 for admin).
 
 ## Architecture
 
@@ -51,13 +93,13 @@ This project demonstrates gRPC request routing based on client version using Env
 │  │                                                            │  │
 │  │  ┌──────────────┐      ┌──────────────────────────┐        │  │
 │  │  │  Agent v1.1  │      │                          │        │  │
-│  │  │  (N replicas)│──────│      Envoy Ingress       │        │  │
-│  │  │              │ gRPC │      (1 replica)         │        │  │
-│  │  │ metadata:    │ +TLS │                          │        │  │
-│  │  │ version=v1.1 │──────│  • TLS termination       │        │  │
-│  │  │ id=pod-name  │      │  • Route by metadata     │        │  │
-│  │  └──────────────┘      │  • HTTP/2 upstream       │        │  │
-│  │                        │                          │        │  │
+│  │  │  (N replicas)│──────│    Proxy Ingress         │        │  │
+│  │  │              │ gRPC │    (Envoy or Traefik)    │        │  │
+│  │  │ metadata:    │ +TLS │    (1 replica)           │        │  │
+│  │  │ version=v1.1 │──────│                          │        │  │
+│  │  │ id=pod-name  │      │  • TLS termination       │        │  │
+│  │  └──────────────┘      │  • Route by metadata     │        │  │
+│  │                        │  • HTTP/2 upstream       │        │  │
 │  │  ┌──────────────┐      │                          │        │  │
 │  │  │  Agent v2.1  │      │                          │        │  │
 │  │  │  (N replicas)│──────│                          │        │  │
@@ -106,7 +148,7 @@ This project demonstrates gRPC request routing based on client version using Env
 
 **Behavior**:
 ```
-1. Connect to envoy-ingress.grpc-routing-poc.svc.cluster.local:8443 (TLS)
+1. Connect to proxy-ingress.grpc-routing-poc.svc.cluster.local:8443 (TLS)
 2. Open bidirectional stream with metadata:
    - agent-version: v1.1
    - agent-id: agent-v1-1-<pod-hash> (from Kubernetes pod name)
@@ -146,51 +188,53 @@ This project demonstrates gRPC request routing based on client version using Env
 7. Handle stream closure gracefully
 ```
 
-#### 3. Envoy Proxy (Ingress)
+#### 3. Proxy (Ingress)
 
 **Purpose**: Routes gRPC bidirectional streams based on metadata with TLS termination.
 
-**Characteristics**:
+**Options**: Envoy or Traefik (deployed via `make deploy-envoy` or `make deploy-traefik`)
+
+**Common Characteristics**:
 - TLS listener on port 8443
 - Routes streams based on `agent-version` header
 - HTTP/2 upstream connections (no TLS)
 - Maintains stream routing throughout connection lifetime
-- Admin interface on port 9901
+- Admin/dashboard interface on port 9901
 
 ##### Routing Rules
 
+Both proxies implement the same routing logic:
+
 1. **Route for v2.* agents**:
-   - Match: header `agent-version` starts with `v2.`
-   - Target: cluster `server-v2`
+   - Match: header `agent-version` matches regex `^v2\..*`
+   - Target: `server-v2.grpc-routing-poc.svc.cluster.local:50051`
    
 2. **Route for v1.* agents**:
-   - Match: header `agent-version` starts with `v1.`
-   - Target: cluster `server-v1`
+   - Match: header `agent-version` matches regex `^v1\..*`
+   - Target: `server-v1.grpc-routing-poc.svc.cluster.local:50051`
 
 3. **Default route**:
    - Match: any request without matching header
-   - Target: cluster `server-v1`
+   - Target: `server-v1.grpc-routing-poc.svc.cluster.local:50051`
 
-##### Clusters
-- **server-v1**:
-  - Upstream: `server-v1.grpc-routing-poc.svc.cluster.local:50051`
-  - Protocol: HTTP/2
-  - LB: Round Robin
-
-- **server-v2**:
-  - Upstream: `server-v2.grpc-routing-poc.svc.cluster.local:50051`
-  - Protocol: HTTP/2
-  - LB: Round Robin
+##### Load Balancing
+- **Algorithm**: Round Robin
+- **Protocol**: HTTP/2 (h2c - cleartext HTTP/2)
+- **Health Checks**: Periodic checks to backend servers
 
 ##### Admin Interface
 
 Access at: `http://localhost:30901`
 
-Useful endpoints:
+**Envoy endpoints**:
 - `/stats` - metrics
 - `/config_dump` - current configuration
 - `/clusters` - cluster status
 - `/listeners` - listener status
+
+**Traefik endpoints**:
+- `/dashboard` - web UI
+- `/api/rawdata` - configuration and runtime data
 
 ##### HTTP/2 Stream Isolation
 
@@ -200,7 +244,7 @@ Envoy maintains a connection pool to upstream servers for efficiency. However, *
 
 ```
 Agent Pod A ──[Stream 1: agent-id=agent-v1-1-abc-123]──┐
-                                                        ├──> Envoy ──[1 TCP]──> Server Pod
+                                                        ├──> Proxy ──[1 TCP]──> Server Pod
 Agent Pod B ──[Stream 3: agent-id=agent-v1-1-def-456]──┘            ├─> Stream 1: agent-id=agent-v1-1-abc-123
                                                                      └─> Stream 3: agent-id=agent-v1-1-def-456
 ```
@@ -287,11 +331,11 @@ Time | Agent v1.1 | Stream     | Backend
 │  ┌──────────────────────────────────────────────────┐  │
 │  │              Namespace: grpc-routing-poc         │  │
 │  │                                                  │  │
-│  │  Agents ────▶ Envoy Service ────▶ Server Services│  │
+│  │  Agents ────▶ Proxy Service ────▶ Server Services│  │
 │  │   (TLS)         (ClusterIP)          (ClusterIP) │  │
 │  │                      │                     │     │  │
 │  │                      ▼                     ▼     │  │
-│  │                 Envoy Pod          Server Pod    │  │
+│  │                 Proxy Pod          Server Pod    │  │
 │  │              (NodePort 30443)    (2x v1, 2x v2)  │  │
 │  └──────────────────────────────────────────────────┘  │
 │                      │                                 │
@@ -304,11 +348,11 @@ Time | Agent v1.1 | Stream     | Backend
 
 ```
 agent-v1-1 pod
-  └─> envoy-ingress.grpc-routing-poc.svc.cluster.local
-       └─> Service envoy-ingress (ClusterIP)
-            └─> Envoy pod
+  └─> proxy-ingress.grpc-routing-poc.svc.cluster.local
+       └─> Service proxy-ingress (ClusterIP)
+            └─> Proxy pod (Envoy or Traefik)
 
-envoy pod
+proxy pod
   ├─> server-v1.grpc-routing-poc.svc.cluster.local
   │    └─> Service server-v1 (ClusterIP)
   │         └─> server-v1 pods (2 replicas)
@@ -323,13 +367,13 @@ envoy pod
 #### Bidirectional Streaming Flow
 
 ```
-Agent v1.1                Envoy                 Server v1
+Agent v1.1                Proxy                 Server v1
     │                       │                       │
     │ ┌─ TLS Handshake ────▶│                       │
     │ │                     │                       │
     │ └◀─ TLS Established ──│                       │
     │                       │                       │
-    │ ┌─ Open Stream ───────▶│                       │
+    │ ┌─ Open Stream ──────▶│                       │
     │ │  metadata:          │                       │
     │ │  - agent-version:v1.1                       │
     │ │  - agent-id:uuid    │                       │
@@ -357,7 +401,7 @@ Agent v1.1                Envoy                 Server v1
     │ ◀─ Pong ──────────────│◀──────────────────────│
     │                       │                       │
     │    (continuous ping-pong every 5s)            │
-    │◀──────────────────────────────────────────────▶│
+    │◀─────────────────────────────────────────────▶│
     │                       │                       │
     ▼                       ▼                       ▼
   Log each message    Forward messages        Log each message
@@ -366,16 +410,16 @@ Agent v1.1                Envoy                 Server v1
 #### Routing Decision
 
 ```
-Stream opens at Envoy
+Stream opens at Proxy
       │
       ▼
 Extract metadata header "agent-version"
       │
-      ├─ v2.* ──────▶ Route to cluster server-v2
+      ├─ v2.* ──────▶ Route to server-v2
       │                     │
-      ├─ v1.* ──────▶ Route to cluster server-v1
+      ├─ v1.* ──────▶ Route to server-v1
       │                     │
-      └─ no match ──▶ Route to cluster server-v1 (default)
+      └─ no match ──▶ Route to server-v1 (default)
                             │
                             ▼
                       Select backend pod
@@ -410,7 +454,9 @@ Extract metadata header "agent-version"
 kind create cluster --name grpc-routing-poc
 
 # 2. Build and deploy everything
-make all
+make all-envoy     # Deploy with Envoy
+# OR
+make all-traefik   # Deploy with Traefik
 
 # 3. Check status
 kubectl get pods -n grpc-routing-poc
@@ -418,14 +464,15 @@ kubectl get pods -n grpc-routing-poc
 # 4. View logs
 make logs-agents-v1
 make logs-agents-v2
+make logs-proxy
 ```
 
 **Expected output** in agent logs:
 ```
-[AGENT_v1.1/agent-v1-1-7df8b5c9d-xyzab] Stream opened to envoy-ingress:8443
+[AGENT_v1.1/agent-v1-1-7df8b5c9d-xyzab] Stream opened to proxy-ingress:8443
 [AGENT_v1.1/agent-v1-1-7df8b5c9d-xyzab] Sent ping
 [AGENT_v1.1/agent-v1-1-7df8b5c9d-xyzab] Received pong from server=v1/server-v1-abc123-def message=pong
-[AGENT_v1.2/agent-v1-2-9gh8k3l2m-pqrst] Stream opened to envoy-ingress:8443
+[AGENT_v1.2/agent-v1-2-9gh8k3l2m-pqrst] Stream opened to proxy-ingress:8443
 [AGENT_v1.2/agent-v1-2-9gh8k3l2m-pqrst] Sent ping
 [AGENT_v1.2/agent-v1-2-9gh8k3l2m-pqrst] Received pong from server=v1/server-v1-abc123-ghi message=pong
 ```
@@ -444,7 +491,7 @@ kubectl get pods -n grpc-routing-poc
 # agent-v1-2-xxx                   1/1     Running   0          2m
 # agent-v2-1-xxx                   1/1     Running   0          2m
 # agent-v2-2-xxx                   1/1     Running   0          2m
-# envoy-ingress-xxx                1/1     Running   0          2m
+# proxy-ingress-xxx                1/1     Running   0          2m
 # server-v1-xxx                    1/1     Running   0          2m
 # server-v1-yyy                    1/1     Running   0          2m
 # server-v2-xxx                    1/1     Running   0          2m
@@ -453,9 +500,9 @@ kubectl get pods -n grpc-routing-poc
 # View services
 kubectl get svc -n grpc-routing-poc
 
-# Check Envoy admin interface
-kubectl port-forward -n grpc-routing-poc svc/envoy-ingress 9901:9901
-# Open http://localhost:9901
+# Check proxy admin interface
+kubectl port-forward -n grpc-routing-poc svc/proxy-ingress 9901:9901
+# Open http://localhost:9901 (Envoy) or http://localhost:9901/dashboard (Traefik)
 ```
 
 ### Routing Verification
@@ -555,9 +602,12 @@ Expected output:
 │   ├── namespace.yaml
 │   ├── server-v1.yaml     # Server v1 Deployment + Service
 │   ├── server-v2.yaml     # Server v2 Deployment + Service
-│   ├── agent-v1.yaml      # Agent v1 Deployment
-│   ├── agent-v2.yaml      # Agent v2 Deployment
-│   └── envoy.yaml         # Envoy Deployment + Service + ConfigMap
+│   ├── agent-v1.1.yaml    # Agent v1.1 Deployment
+│   ├── agent-v1.2.yaml    # Agent v1.2 Deployment
+│   ├── agent-v2.1.yaml    # Agent v2.1 Deployment
+│   ├── agent-v2.2.yaml    # Agent v2.2 Deployment
+│   ├── envoy.yaml         # Envoy Deployment + Service + ConfigMap
+│   └── traefik.yaml       # Traefik Deployment + Service + ConfigMap
 ├── scripts/
 │   ├── verify-routing.sh       # Automated routing verification
 │   └── test-sticky-routing.sh  # Sticky routing test
@@ -655,10 +705,6 @@ kubectl get pods -n grpc-routing-poc -l version=v1.1 -o custom-columns=NAME:.met
 kubectl logs -n grpc-routing-poc -l app=server,version=v1 --tail=20 | grep "Stream opened"
 # Expected: Multiple "Stream opened from agent-id=agent-v1-1-<different-hashes>"
 
-# Monitor Envoy metrics
-kubectl port-forward -n grpc-routing-poc svc/envoy-ingress 9901:9901
-curl http://localhost:9901/stats | grep grpc
-
 # Scale servers to handle load
 kubectl scale deployment server-v1 --replicas=4 -n grpc-routing-poc
 kubectl scale deployment server-v2 --replicas=4 -n grpc-routing-poc
@@ -679,37 +725,6 @@ make logs-agent-v1-1 -f
 # - Ping/pong messages resume with same routing
 ```
 
-#### 4. TLS Testing
-
-```bash
-# Test with insecure connection (should fail)
-kubectl run test-pod --rm -it --image=nicolaka/netshoot -n grpc-routing-poc -- /bin/bash
-grpcurl -plaintext envoy-ingress:8443 list
-# Should fail: TLS required
-
-# Test with TLS (should work via NodePort)
-grpcurl -insecure localhost:30443 list
-```
-
-#### 5. Metadata Testing
-
-```bash
-# List available services
-grpcurl -insecure localhost:30443 list
-# Should show: ping.PingService
-
-# List methods
-grpcurl -insecure localhost:30443 list ping.PingService
-# Should show: ping.PingService.PingPong
-
-# Test bidirectional streaming (requires manual message sending)
-# Note: grpcurl has limited support for bidirectional streaming
-# Best to verify routing using agent logs and server logs
-
-# Check routing without agent-version header (uses default route)
-# Monitor logs: should route to server-v1 (default route)
-```
-
 ## Makefile Commands
 
 ```bash
@@ -723,8 +738,10 @@ make apply-certs    # Apply certificates to Kubernetes
 # Build and deploy
 make build          # Build Docker images
 make load           # Load images into kind cluster
-make deploy         # Deploy to Kubernetes
-make all            # Full setup: certs + build + load + deploy
+make deploy-envoy   # Deploy with Envoy proxy
+make deploy-traefik # Deploy with Traefik proxy
+make all-envoy      # Full setup with Envoy: certs + build + load + deploy
+make all-traefik    # Full setup with Traefik: certs + build + load + deploy
 
 # Log viewing
 make logs-server-v1      # View server-v1 logs
@@ -735,7 +752,9 @@ make logs-agent-v2-1     # View agent-v2.1 logs
 make logs-agent-v2-2     # View agent-v2.2 logs
 make logs-agents-v1      # View all v1.x agent logs
 make logs-agents-v2      # View all v2.x agent logs
-make logs-envoy          # View Envoy logs
+make logs-envoy          # View Envoy proxy logs
+make logs-traefik        # View Traefik proxy logs
+make logs-proxy          # View active proxy logs
 
 # Cleanup
 make clean          # Delete namespace and all resources
@@ -778,28 +797,29 @@ kubectl scale deployment server-v2 --replicas=5 -n grpc-routing-poc
 # - Existing connections remain sticky
 ```
 
-#### Scaling Envoy
+#### Scaling Proxy
 
 ```bash
-# Scale Envoy (multiple instances)
-kubectl scale deployment envoy-ingress --replicas=3 -n grpc-routing-poc
+# Scale proxy (multiple instances)
+kubectl scale deployment proxy-ingress --replicas=3 -n grpc-routing-poc
 
 # Considerations:
 # - Service LoadBalancer distributes connections
-# - Each Envoy instance handles its own connections
-# - No shared state between Envoy instances
+# - Each proxy instance handles its own connections
+# - No shared state between proxy instances
 ```
 
 ## Monitoring
 
-### Envoy Metrics
+### Proxy Metrics
 
 Access admin interface:
 ```bash
-kubectl port-forward -n grpc-routing-poc svc/envoy-ingress 9901:9901
+kubectl port-forward -n grpc-routing-poc svc/proxy-ingress 9901:9901
 ```
 
-Useful metrics:
+#### Envoy Metrics
+
 ```bash
 # Connection stats
 curl http://localhost:9901/stats | grep cx_active
@@ -814,6 +834,18 @@ curl http://localhost:9901/clusters
 
 # Upstream connections
 curl http://localhost:9901/stats | grep upstream_cx
+```
+
+#### Traefik Metrics
+
+```bash
+# Web dashboard
+open http://localhost:9901/dashboard
+
+# API endpoints
+curl http://localhost:9901/api/http/routers
+curl http://localhost:9901/api/http/services
+curl http://localhost:9901/api/rawdata
 ```
 
 ### Application Logs

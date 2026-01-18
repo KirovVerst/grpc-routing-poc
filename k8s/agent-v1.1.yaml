@@ -32,7 +32,7 @@ spec:
             fieldRef:
               fieldPath: metadata.name
         - name: SERVER_ADDRESS
-          value: "envoy-ingress.grpc-routing-poc.svc.cluster.local:8443"
+          value: "proxy-ingress.grpc-routing-poc.svc.cluster.local:8443"
         - name: USE_TLS
           value: "true"
         resources:
